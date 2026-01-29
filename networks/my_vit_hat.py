@@ -42,6 +42,8 @@ _logger = logging.getLogger(__name__)
 
 
 def _cfg(url='', **kwargs):
+    # NOTE: keep compatibility with older timm versions that don't accept `hf_hub`
+    kwargs.pop('hf_hub', None)
     return {
         'url': url,
         'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': None,
@@ -244,8 +246,10 @@ class Adapter(nn.Module):
         return out
 
     def append_embedddings(self):
-        self.ec1.append(nn.Parameter(torch.randn(1, self.out_dim, device='cuda')))
-        self.ec2.append(nn.Parameter(torch.randn(1, self.in_dim, device='cuda')))
+        # NOTE: do not hardcode CUDA; follow module device
+        dev = self.fc1.weight.device
+        self.ec1.append(nn.Parameter(torch.randn(1, self.out_dim, device=dev)))
+        self.ec2.append(nn.Parameter(torch.randn(1, self.in_dim, device=dev)))
 
 class Block(nn.Module):
 
@@ -446,7 +450,8 @@ class MyVisionTransformer(nn.Module):
 
     def append_embedddings(self):
         # append head
-        self.head.append(nn.Linear(self.embed_dim, self.num_classes).cuda())
+        dev = self.cls_token.device
+        self.head.append(nn.Linear(self.embed_dim, self.num_classes).to(dev))
 
         self.list_norm.append(deepcopy(self.norm))
         for b in self.blocks:
