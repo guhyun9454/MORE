@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from continual_datasets.build_incremental_scenario import build_continual_dataloader
 from continual_datasets.dataset_utils import get_ood_dataset, set_data_config
-from networks.my_vit_hat import vit_base_patch16_224
+from networks.my_vit_hat import deit_small_patch16_224, vit_base_patch16_224
 from utils.sgd_hat import SGD_hat
 
 
@@ -69,23 +69,194 @@ def save_accuracy_heatmap(acc_matrix: np.ndarray, task_id: int, args) -> str:
     return path
 
 
+def _random_subset(dataset: torch.utils.data.Dataset, n_samples: int, seed: int) -> torch.utils.data.Dataset:
+    n_samples = int(n_samples)
+    if n_samples <= 0:
+        raise ValueError("n_samples must be > 0.")
+    n_total = len(dataset)
+    if n_samples >= n_total:
+        return dataset
+    rng = np.random.default_rng(int(seed))
+    idx = rng.choice(n_total, size=n_samples, replace=False).tolist()
+    return torch.utils.data.Subset(dataset, idx)
+
+
+def load_more_deit_pretrain_if_available(net: nn.Module, ckpt_path: str, require: bool = False) -> bool:
+    """
+    Load the MORE-provided DeiT pre-trained checkpoint (README: ./deit_pretrained/best_checkpoint.pth).
+    Returns True if loaded, False if not found (unless require=True).
+    """
+    ckpt_path = str(ckpt_path)
+    if ckpt_path and os.path.isfile(ckpt_path):
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        pretrain = checkpoint.get("model", checkpoint)
+        target = net.state_dict()
+        transfer = {k: v for k, v in pretrain.items() if (k in target) and ("head" not in k)}
+        target.update(transfer)
+        net.load_state_dict(target)
+        return True
+
+    if require:
+        raise FileNotFoundError(
+            f"Cannot find MORE pre-trained checkpoint at '{ckpt_path}'. "
+            "Download it per README and place it at ./deit_pretrained/best_checkpoint.pth "
+            "(or pass --more_pretrain_path)."
+        )
+    return False
+
+
+@torch.no_grad()
+def _compute_more_confidence_scores(model: nn.Module, data_loader, device: torch.device) -> np.ndarray:
+    """
+    MORE OOD score in the paper (Algorithm 2, step 6):
+    s(x) = max_{k<=t} p(Y_k|x,k) * s_k(x)
+
+    This model returns log-scores over global classes, so we can use max-log-score
+    as a monotonic confidence score for AUROC/FPR@TPR95.
+    """
+    model.eval()
+    scores: List[torch.Tensor] = []
+    for batch_idx, (inputs, _targets) in enumerate(data_loader):
+        inputs = inputs.to(device, non_blocking=True)
+        out = model(inputs)  # [B, C] log-scores
+        conf = out.max(dim=1).values.detach().cpu()
+        scores.append(conf)
+    if len(scores) == 0:
+        return np.zeros((0,), dtype=np.float32)
+    return torch.cat(scores, dim=0).to(dtype=torch.float32).numpy()
+
+
+def _auroc_and_fpr95(id_scores: np.ndarray, ood_scores: np.ndarray) -> Tuple[float, float]:
+    """
+    Compute AUROC and FPR@TPR95 without sklearn.
+
+    Convention:
+    - ID is positive (label=1) and should have higher score than OOD (label=0).
+    """
+    id_scores = np.asarray(id_scores, dtype=np.float64).reshape(-1)
+    ood_scores = np.asarray(ood_scores, dtype=np.float64).reshape(-1)
+    if id_scores.size == 0 or ood_scores.size == 0:
+        raise ValueError("Empty score array for AUROC computation.")
+
+    scores = np.concatenate([id_scores, ood_scores], axis=0)
+    labels = np.concatenate([np.ones_like(id_scores), np.zeros_like(ood_scores)], axis=0)
+
+    # sort by descending score (stable sort for tie handling)
+    order = np.argsort(-scores, kind="mergesort")
+    labels = labels[order]
+
+    P = float(labels.sum())
+    N = float(labels.size - P)
+    if P <= 0 or N <= 0:
+        raise ValueError("Invalid positive/negative counts for AUROC computation.")
+
+    tps = np.cumsum(labels)
+    fps = np.cumsum(1.0 - labels)
+
+    tpr = tps / P
+    fpr = fps / N
+
+    # add origin
+    tpr = np.concatenate([[0.0], tpr])
+    fpr = np.concatenate([[0.0], fpr])
+
+    auroc = float(np.trapz(tpr, fpr))
+    idx = int(np.searchsorted(tpr, 0.95, side="left"))
+    idx = min(max(idx, 0), int(fpr.size - 1))
+    fpr95 = float(fpr[idx])
+    return auroc, fpr95
+
+
+def evaluate_ood_detection(
+    model: nn.Module,
+    id_dataset: torch.utils.data.Dataset,
+    ood_dataset: torch.utils.data.Dataset,
+    device: torch.device,
+    args,
+    task_id: int,
+    tag: str,
+    auc_history: Optional[List[float]] = None,
+) -> Dict[str, float]:
+    """
+    Evaluate OOD detection using MORE confidence score (max output with MD coefficient).
+    """
+    id_size, ood_size = int(len(id_dataset)), int(len(ood_dataset))
+    use_n = min(id_size, ood_size)
+    if int(getattr(args, "ood_eval_samples", 0)) > 0:
+        use_n = min(use_n, int(args.ood_eval_samples))
+    if bool(getattr(args, "develop", False)):
+        use_n = min(use_n, 1000)
+    if use_n <= 0:
+        raise ValueError("Cannot run OOD eval with non-positive sample count.")
+
+    id_ds = _random_subset(id_dataset, use_n, seed=int(args.seed) + 12345) if id_size > use_n else id_dataset
+    ood_ds = _random_subset(ood_dataset, use_n, seed=int(args.seed) + 54321) if ood_size > use_n else ood_dataset
+
+    id_loader = torch.utils.data.DataLoader(
+        id_ds, batch_size=int(args.batch_size), shuffle=False, num_workers=int(args.num_workers), pin_memory=True
+    )
+    ood_loader = torch.utils.data.DataLoader(
+        ood_ds, batch_size=int(args.batch_size), shuffle=False, num_workers=int(args.num_workers), pin_memory=True
+    )
+
+    id_scores = _compute_more_confidence_scores(model, id_loader, device)
+    ood_scores = _compute_more_confidence_scores(model, ood_loader, device)
+    auroc, fpr95 = _auroc_and_fpr95(id_scores, ood_scores)
+
+    if auc_history is not None:
+        auc_history.append(float(auroc))
+        iauc = float(np.mean(np.array(auc_history, dtype=np.float64)))
+    else:
+        iauc = float("nan")
+
+    print(
+        f"[{tag}] (TASK {task_id+1}) AUROC {auroc * 100:.2f}% | IAUC {iauc * 100:.2f}% | "
+        f"FPR@TPR95 {fpr95 * 100:.2f}% | N={use_n}"
+    )
+
+    if args.wandb:
+        import wandb
+
+        payload = {
+            f"{tag}_AUROC (↑)": auroc * 100.0,
+            f"{tag}_FPR@TPR95 (↓)": fpr95 * 100.0,
+            "TASK": task_id,
+            f"{tag}_N": use_n,
+        }
+        if not math.isnan(iauc):
+            payload[f"{tag}_IAUC (↑)"] = iauc * 100.0
+        wandb.log(payload)
+
+    return {"auroc": float(auroc), "fpr_at_tpr95": float(fpr95), "n": float(use_n), "iauc": float(iauc)}
+
+
 class ByteReplayBuffer:
     """
-    Class-balanced replay buffer with capacity specified in *bytes*.
+    Replay buffer with capacity specified in *bytes*.
     Stored tensors are kept on CPU; sampling moves them to the requested device.
+
+    NOTE (VIL compatibility):
+    - We additionally store the originating task-id per sample so back-update can
+      draw IND samples for a specific previous task even when global class labels
+      overlap across tasks (common in VIL scenarios).
     """
 
-    def __init__(self, capacity_bytes: int, seed: int = 0):
+    def __init__(self, capacity_bytes: int, seed: int = 0, store_dtype: str = "uint8"):
         self.capacity_bytes = int(capacity_bytes)
         self.seed = int(seed)
         self.rng = np.random.default_rng(self.seed)
+        self.store_dtype = str(store_dtype).lower()
+        if self.store_dtype not in {"uint8", "float32"}:
+            raise ValueError("store_dtype must be one of: {'uint8', 'float32'}")
 
         self._bytes_per_sample: Optional[int] = None
-        self._x_by_class: Dict[int, torch.Tensor] = {}
-        self._y_by_class: Dict[int, torch.Tensor] = {}
+        # key = (task_id, global_class)
+        self._x_by_key: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._y_by_key: Dict[Tuple[int, int], torch.Tensor] = {}
 
         self._x_all: Optional[torch.Tensor] = None
         self._y_all: Optional[torch.Tensor] = None
+        self._t_all: Optional[torch.Tensor] = None
 
     def __len__(self) -> int:
         if self._y_all is None:
@@ -93,27 +264,45 @@ class ByteReplayBuffer:
         return int(self._y_all.numel())
 
     def bytes_used(self) -> int:
-        if self._x_all is None or self._y_all is None:
+        if self._x_all is None or self._y_all is None or self._t_all is None:
             return 0
-        return tensor_total_bytes(self._x_all) + tensor_total_bytes(self._y_all)
+        return tensor_total_bytes(self._x_all) + tensor_total_bytes(self._y_all) + tensor_total_bytes(self._t_all)
+
+    def _encode_x(self, x: torch.Tensor) -> torch.Tensor:
+        # Store images more byte-efficiently when capacity is specified in bytes.
+        # ToTensor() yields float in [0,1] with 8-bit granularity, so uint8 round-trip is effectively lossless.
+        if self.store_dtype == "uint8":
+            return (x * 255.0).round().clamp(0, 255).to(dtype=torch.uint8)
+        return x.to(dtype=torch.float32)
+
+    def _decode_x(self, x: torch.Tensor) -> torch.Tensor:
+        if self.store_dtype == "uint8":
+            return x.to(dtype=torch.float32) / 255.0
+        return x
 
     def _rebuild_flat_cache(self):
-        if len(self._x_by_class) == 0:
+        if len(self._x_by_key) == 0:
             self._x_all = None
             self._y_all = None
+            self._t_all = None
             return
         xs, ys = [], []
-        for y in sorted(self._x_by_class.keys()):
-            xs.append(self._x_by_class[y])
-            ys.append(self._y_by_class[y])
+        ts: List[torch.Tensor] = []
+        for task_id, y in sorted(self._x_by_key.keys()):
+            xk = self._x_by_key[(task_id, y)]
+            yk = self._y_by_key[(task_id, y)]
+            xs.append(xk)
+            ys.append(yk)
+            ts.append(torch.full((xk.size(0),), fill_value=int(task_id), dtype=torch.int64))
         self._x_all = torch.cat(xs, dim=0).contiguous()
         self._y_all = torch.cat(ys, dim=0).contiguous()
+        self._t_all = torch.cat(ts, dim=0).contiguous()
 
-    def _infer_bytes_per_sample(self, x: torch.Tensor, y: torch.Tensor):
+    def _infer_bytes_per_sample(self, x: torch.Tensor, y: torch.Tensor, t: torch.Tensor):
         if self._bytes_per_sample is not None:
             return
         # store per-sample bytes using the requested formula
-        self._bytes_per_sample = tensor_total_bytes(x) + tensor_total_bytes(y)
+        self._bytes_per_sample = tensor_total_bytes(x) + tensor_total_bytes(y) + tensor_total_bytes(t)
 
     def _max_samples_total(self) -> int:
         if self.capacity_bytes <= 0 or self._bytes_per_sample is None or self._bytes_per_sample <= 0:
@@ -121,59 +310,66 @@ class ByteReplayBuffer:
         return int(self.capacity_bytes // self._bytes_per_sample)
 
     @torch.no_grad()
-    def update_from_loader(self, data_loader: torch.utils.data.DataLoader, new_classes: List[int]):
+    def update_from_loader(self, data_loader: torch.utils.data.DataLoader, task_id: int, new_classes: List[int]):
         """
         Merge new samples (from current task) into buffer, then downsample per-class to fit the
-        total byte budget while keeping per-class counts equal.
+        total byte budget while keeping per-(task,class) counts equal.
         """
         if self.capacity_bytes <= 0:
             return
+
+        task_id = int(task_id)
 
         # infer bytes/sample from the first available sample
         if self._bytes_per_sample is None:
             for x, y in data_loader:
                 if x.numel() == 0:
                     continue
-                x0 = x[0].detach().cpu()
+                x0 = self._encode_x(x[0].detach().cpu())
                 y0 = y[0].detach().cpu()
-                self._infer_bytes_per_sample(x0, y0)
+                t0 = torch.tensor(task_id, dtype=torch.int64)
+                self._infer_bytes_per_sample(x0, y0, t0)
                 break
 
         max_total = self._max_samples_total()
         if max_total <= 0:
             # cannot store even 1 sample within byte budget
-            self._x_by_class = {}
-            self._y_by_class = {}
+            self._x_by_key = {}
+            self._y_by_key = {}
             self._rebuild_flat_cache()
             return
 
-        existing_classes = set(self._x_by_class.keys())
-        seen_after = sorted(existing_classes.union(set(int(c) for c in new_classes)))
+        existing_keys = set(self._x_by_key.keys())
+        new_keys = [(task_id, int(c)) for c in new_classes]
+        seen_after = sorted(existing_keys.union(set(new_keys)))
         if len(seen_after) == 0:
             return
 
-        per_class_quota = int(max_total // len(seen_after))
-        if per_class_quota <= 0:
-            # not enough capacity to allocate >=1 per seen class
-            self._x_by_class = {}
-            self._y_by_class = {}
+        per_key_quota = int(max_total // len(seen_after))
+        if per_key_quota <= 0:
+            # not enough capacity to allocate >=1 per seen (task,class)
+            self._x_by_key = {}
+            self._y_by_key = {}
             self._rebuild_flat_cache()
             return
 
         # collect candidates from current loader (early-stop when we have enough per class)
-        need = {int(c): per_class_quota for c in new_classes}
-        collected_x: Dict[int, List[torch.Tensor]] = {int(c): [] for c in new_classes}
-        collected_y: Dict[int, List[torch.Tensor]] = {int(c): [] for c in new_classes}
+        new_class_set = set(int(c) for c in new_classes)
+        need = {(task_id, int(c)): per_key_quota for c in new_classes}
+        collected_x: Dict[Tuple[int, int], List[torch.Tensor]] = {(task_id, int(c)): [] for c in new_classes}
+        collected_y: Dict[Tuple[int, int], List[torch.Tensor]] = {(task_id, int(c)): [] for c in new_classes}
 
         for x, y in data_loader:
-            x_cpu = x.detach().cpu()
+            x_cpu = self._encode_x(x.detach().cpu())
             y_cpu = y.detach().cpu()
             for i in range(x_cpu.size(0)):
                 cls = int(y_cpu[i].item())
-                if cls in need and need[cls] > 0:
-                    collected_x[cls].append(x_cpu[i : i + 1])  # keep batch dim
-                    collected_y[cls].append(y_cpu[i : i + 1])
-                    need[cls] -= 1
+                if cls in new_class_set:
+                    key = (task_id, cls)
+                    if key in need and need[key] > 0:
+                        collected_x[key].append(x_cpu[i : i + 1])  # keep batch dim
+                        collected_y[key].append(y_cpu[i : i + 1])
+                        need[key] -= 1
 
             if all(v <= 0 for v in need.values()):
                 break
@@ -181,43 +377,94 @@ class ByteReplayBuffer:
         # merge candidates
         for cls in new_classes:
             cls = int(cls)
-            if len(collected_x.get(cls, [])) == 0:
+            key = (task_id, cls)
+            if len(collected_x.get(key, [])) == 0:
                 continue
-            x_new = torch.cat(collected_x[cls], dim=0)
-            y_new = torch.cat(collected_y[cls], dim=0)
+            x_new = torch.cat(collected_x[key], dim=0)
+            y_new = torch.cat(collected_y[key], dim=0)
 
-            if cls in self._x_by_class:
-                self._x_by_class[cls] = torch.cat([self._x_by_class[cls], x_new], dim=0)
-                self._y_by_class[cls] = torch.cat([self._y_by_class[cls], y_new], dim=0)
+            if key in self._x_by_key:
+                self._x_by_key[key] = torch.cat([self._x_by_key[key], x_new], dim=0)
+                self._y_by_key[key] = torch.cat([self._y_by_key[key], y_new], dim=0)
             else:
-                self._x_by_class[cls] = x_new
-                self._y_by_class[cls] = y_new
+                self._x_by_key[key] = x_new
+                self._y_by_key[key] = y_new
 
-        # downsample all seen classes to per_class_quota
-        for cls in list(self._x_by_class.keys()):
-            x_cls = self._x_by_class[cls]
-            if x_cls.size(0) > per_class_quota:
-                idx = torch.from_numpy(self.rng.permutation(x_cls.size(0))[:per_class_quota]).long()
-                self._x_by_class[cls] = x_cls[idx].contiguous()
-                self._y_by_class[cls] = self._y_by_class[cls][idx].contiguous()
+        # downsample all seen (task,class) to per_key_quota
+        for key in list(self._x_by_key.keys()):
+            x_cls = self._x_by_key[key]
+            if x_cls.size(0) > per_key_quota:
+                idx = torch.from_numpy(self.rng.permutation(x_cls.size(0))[:per_key_quota]).long()
+                self._x_by_key[key] = x_cls[idx].contiguous()
+                self._y_by_key[key] = self._y_by_key[key][idx].contiguous()
 
         self._rebuild_flat_cache()
 
         # final safety (should already hold)
         if self.bytes_used() > self.capacity_bytes:
             # fallback: global truncate (rare, e.g., if shapes vary)
-            if self._x_all is not None and self._y_all is not None:
+            if self._x_all is not None and self._y_all is not None and self._t_all is not None:
                 max_keep = max_total
                 self._x_all = self._x_all[:max_keep].contiguous()
                 self._y_all = self._y_all[:max_keep].contiguous()
+                self._t_all = self._t_all[:max_keep].contiguous()
 
-    def sample(self, n_samples: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def sample(self, n_samples: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(self) == 0:
             raise ValueError("Replay buffer is empty – cannot sample.")
         n = min(int(n_samples), len(self))
         idx = torch.randperm(len(self))[:n]
-        assert self._x_all is not None and self._y_all is not None
-        return self._x_all[idx].to(device), self._y_all[idx].to(device)
+        assert self._x_all is not None and self._y_all is not None and self._t_all is not None
+        x = self._decode_x(self._x_all[idx]).to(device)
+        return x, self._y_all[idx].to(device), self._t_all[idx].to(device)
+
+    def sample_in_task(
+        self, task_id: int, n_samples: int, device: Optional[torch.device] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if len(self) == 0:
+            raise ValueError("Replay buffer is empty – cannot sample.")
+        assert self._x_all is not None and self._y_all is not None and self._t_all is not None
+
+        task_id = int(task_id)
+        mask = self._t_all == task_id
+        idx_all = torch.nonzero(mask, as_tuple=False).view(-1)
+        if idx_all.numel() == 0:
+            raise ValueError("No samples found for the requested task.")
+
+        n = min(int(n_samples), int(idx_all.numel()))
+        sel = idx_all[torch.randperm(idx_all.numel())[:n]]
+        x_sel = self._decode_x(self._x_all[sel])
+        y_sel = self._y_all[sel]
+        t_sel = self._t_all[sel]
+        if device is not None:
+            x_sel = x_sel.to(device)
+            y_sel = y_sel.to(device)
+            t_sel = t_sel.to(device)
+        return x_sel, y_sel, t_sel
+
+    def sample_not_in_task(
+        self, task_id: int, n_samples: int, device: Optional[torch.device] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if len(self) == 0:
+            raise ValueError("Replay buffer is empty – cannot sample.")
+        assert self._x_all is not None and self._y_all is not None and self._t_all is not None
+
+        task_id = int(task_id)
+        mask = self._t_all != task_id
+        idx_all = torch.nonzero(mask, as_tuple=False).view(-1)
+        if idx_all.numel() == 0:
+            raise ValueError("No samples found outside the requested task.")
+
+        n = min(int(n_samples), int(idx_all.numel()))
+        sel = idx_all[torch.randperm(idx_all.numel())[:n]]
+        x_sel = self._decode_x(self._x_all[sel])
+        y_sel = self._y_all[sel]
+        t_sel = self._t_all[sel]
+        if device is not None:
+            x_sel = x_sel.to(device)
+            y_sel = y_sel.to(device)
+            t_sel = t_sel.to(device)
+        return x_sel, y_sel, t_sel
 
     def sample_in_classes(
         self, class_set: set, n_samples: int, device: Optional[torch.device] = None
@@ -239,7 +486,7 @@ class ByteReplayBuffer:
 
         n = min(int(n_samples), int(idx_all.numel()))
         sel = idx_all[torch.randperm(idx_all.numel())[:n]]
-        x_sel = self._x_all[sel]
+        x_sel = self._decode_x(self._x_all[sel])
         y_sel = self._y_all[sel]
         if device is not None:
             x_sel = x_sel.to(device)
@@ -263,7 +510,7 @@ class ByteReplayBuffer:
 
         n = min(int(n_samples), int(idx_all.numel()))
         sel = idx_all[torch.randperm(idx_all.numel())[:n]]
-        x_sel = self._x_all[sel]
+        x_sel = self._decode_x(self._x_all[sel])
         y_sel = self._y_all[sel]
         if device is not None:
             x_sel = x_sel.to(device)
@@ -623,11 +870,9 @@ def back_update_previous_heads(
     bs = int(args.back_update_batch_size)
 
     for prev_task in range(current_task_id):
-        ind_set = set(int(c) for c in class_mask[prev_task])
-
-        # IND samples from replay (classes in ind_set)
+        # IND samples from replay (task-specific)
         try:
-            x_ind, y_ind = replay.sample_in_classes(ind_set, per_head, device=None)
+            x_ind, y_ind, _t_ind = replay.sample_in_task(prev_task, per_head, device=None)
         except Exception:
             continue
 
@@ -636,11 +881,11 @@ def back_update_previous_heads(
             dtype=torch.long,
         )
 
-        # OOD samples: replay samples not in ind_set + (if needed) samples from current task loader
+        # OOD samples: replay samples not in this task + (if needed) samples from current task loader
         x_ood_parts: List[torch.Tensor] = []
         need_ood = int(x_ind.size(0))
         try:
-            x_ood_buf, _y_ood_buf = replay.sample_not_in_classes(ind_set, need_ood, device=None)
+            x_ood_buf, _y_ood_buf, _t_ood_buf = replay.sample_not_in_task(prev_task, need_ood, device=None)
             x_ood_parts.append(x_ood_buf)
             need_ood -= int(x_ood_buf.size(0))
         except Exception:
@@ -648,7 +893,7 @@ def back_update_previous_heads(
 
         if need_ood > 0:
             x_ood_cur, _y_ood_cur = collect_samples_from_loader(
-                current_train_loader, predicate=lambda yy: int(yy) not in ind_set, n_samples=need_ood
+                current_train_loader, predicate=lambda _yy: True, n_samples=need_ood
             )
             if x_ood_cur is not None:
                 x_ood_parts.append(x_ood_cur)
@@ -730,12 +975,11 @@ class TrainerOODVILMore:
             inputs_all = inputs
             labels_all = local_targets
             if args.replay_buffer_bytes > 0 and len(replay) > 0 and args.replay_batch_size > 0:
-                x_bf, y_bf_global = replay.sample(args.replay_batch_size, device=device)
-                # Generalized MORE labeling:
-                # - if replay sample's global class is in current task's class set => treat as IND (mapped local label)
-                # - else => treat as OOD (last class)
-                y_bf_local = torch.tensor(
-                    [class_to_local.get(int(y), args.num_cls_per_task) for y in y_bf_global.detach().cpu().tolist()],
+                x_bf, _y_bf_global, _t_bf = replay.sample(args.replay_batch_size, device=device)
+                # MORE (Kim et al., 2022): treat all buffer samples as OOD for the current task
+                y_bf_local = torch.full(
+                    (x_bf.size(0),),
+                    fill_value=int(args.num_cls_per_task),
                     device=device,
                     dtype=torch.long,
                 )
@@ -856,6 +1100,26 @@ def parse_args():
     p.add_argument("--momentum", type=float, default=0.9)
     p.add_argument("--weight_decay", type=float, default=0.0)
 
+    # backbone / pretrain
+    p.add_argument(
+        "--backbone",
+        type=str,
+        default="deit_small_patch16_224",
+        choices=["deit_small_patch16_224", "vit_base_patch16_224"],
+        help="Paper uses DeiT-S/16 (deit_small_patch16_224).",
+    )
+    p.add_argument(
+        "--more_pretrain_path",
+        type=str,
+        default="./deit_pretrained/best_checkpoint.pth",
+        help="Path to MORE pre-trained DeiT checkpoint (as in README).",
+    )
+    p.add_argument(
+        "--require_more_pretrain",
+        action="store_true",
+        help="If set, error out when MORE pretrain checkpoint is missing.",
+    )
+
     # MORE / ViT-Adapter / HAT
     p.add_argument("--adapter_latent", type=int, default=64)
     p.add_argument("--freeze_head", action="store_true")
@@ -865,12 +1129,20 @@ def parse_args():
     p.add_argument("--thres_cosh", type=float, default=50.0)
     p.add_argument("--thres_emb", type=float, default=6.0)
     p.add_argument("--md_c", type=float, default=20.0)
-    p.add_argument("--infer_T", type=float, default=2.0)
+    # Paper uses raw softmax probabilities (no temperature). Keep configurable but default to 1.0.
+    p.add_argument("--infer_T", type=float, default=1.0)
     p.add_argument("--md_max_samples_per_class", type=int, default=128)
 
     # replay buffer (BYTES)
     p.add_argument("--replay_buffer_bytes", type=int, default=0)
     p.add_argument("--replay_batch_size", type=int, default=-1)
+    p.add_argument(
+        "--replay_store_dtype",
+        type=str,
+        default="uint8",
+        choices=["uint8", "float32"],
+        help="How to store replay images inside the byte-budgeted buffer.",
+    )
 
     # back-updating (optional; can be expensive)
     p.add_argument("--back_update", action="store_true")
@@ -891,6 +1163,8 @@ def parse_args():
 
     # optional OOD dataset (kept for parity; not required for core MORE eval)
     p.add_argument("--ood_dataset", type=str, default=None)
+    p.add_argument("--ood_eval_samples", type=int, default=0, help="If >0, use this many ID/OOD samples each for AUROC.")
+    p.add_argument("--ood_eval_every", type=int, default=1, help="Run OOD eval every N tasks (default: 1).")
 
     return p.parse_args()
 
@@ -945,12 +1219,34 @@ def main():
         wandb.init(entity="OODVIL", project=args.wandb_project, name=args.wandb_run, config=vars(args))
         wandb.config.update({"username": getpass.getuser()})
 
-    # model (ViT-B/16 backbone + adapters + HAT)
-    net = vit_base_patch16_224(pretrained=True, num_classes=args.num_cls_per_task + 1, latent=args.adapter_latent, args=args)
+    # model (paper backbone: DeiT-S/16)
+    if args.backbone == "deit_small_patch16_224":
+        build_fn = deit_small_patch16_224
+    elif args.backbone == "vit_base_patch16_224":
+        build_fn = vit_base_patch16_224
+    else:
+        raise ValueError(f"Unknown backbone: {args.backbone}")
+
+    # If MORE checkpoint exists, load it (paper setting). Otherwise fall back to timm pretrained weights.
+    use_timm_pretrained = not os.path.isfile(str(args.more_pretrain_path))
+    net = build_fn(
+        pretrained=use_timm_pretrained,
+        num_classes=args.num_cls_per_task + 1,
+        latent=args.adapter_latent,
+        args=args,
+    )
+    if not use_timm_pretrained:
+        loaded = load_more_deit_pretrain_if_available(net, args.more_pretrain_path, require=args.require_more_pretrain)
+        if loaded:
+            print(f"Loaded MORE pretrain from: {args.more_pretrain_path}")
+    else:
+        if args.require_more_pretrain:
+            load_more_deit_pretrain_if_available(net, args.more_pretrain_path, require=True)
+        print("MORE pretrain not found; using timm pretrained backbone weights.")
     net.to(device)
 
     # replay
-    replay = ByteReplayBuffer(capacity_bytes=args.replay_buffer_bytes, seed=args.seed)
+    replay = ByteReplayBuffer(capacity_bytes=args.replay_buffer_bytes, seed=args.seed, store_dtype=args.replay_store_dtype)
 
     # inference wrapper
     wrapper = MoreOODVILWrapper(
@@ -968,6 +1264,7 @@ def main():
 
     p_mask = None
     mask_back = None
+    ext_auc_hist: List[float] = []
 
     for task_id in range(args.num_tasks):
         print(f"{f'Training on Task {task_id+1}/{args.num_tasks}':=^60}")
@@ -1037,7 +1334,7 @@ def main():
         mask_back = freeze_mask(net, p_mask)
 
         # end-task: update replay memory (byte-budgeted)
-        replay.update_from_loader(data_loader[task_id]["train"], new_classes=class_mask[task_id])
+        replay.update_from_loader(data_loader[task_id]["train"], task_id=task_id, new_classes=class_mask[task_id])
         if args.wandb:
             import wandb
 
@@ -1073,6 +1370,27 @@ def main():
         trainer.evaluate_till_now(wrapper, data_loader, device, task_id, acc_matrix, args)
         eval_duration = time.time() - eval_start
         print(f"Task {task_id+1} evaluation completed in {str(datetime.timedelta(seconds=int(eval_duration)))}")
+
+        # OOD detection evaluation
+        do_ood_eval = int(args.ood_eval_every) > 0 and ((task_id + 1) % int(args.ood_eval_every) == 0)
+        if do_ood_eval:
+            id_dataset = torch.utils.data.ConcatDataset([data_loader[t]["val"].dataset for t in range(task_id + 1)])
+
+            # (1) External OOD dataset (user-provided, e.g., EMNIST)
+            if args.ood_dataset:
+                ood_ds = data_loader[-1].get("ood", None)
+                if ood_ds is not None:
+                    print(f"{f'OOD Detection (external: {args.ood_dataset})':=^60}")
+                    evaluate_ood_detection(
+                        model=wrapper,
+                        id_dataset=id_dataset,
+                        ood_dataset=ood_ds,
+                        device=device,
+                        args=args,
+                        task_id=task_id,
+                        tag=f"EXT_{args.ood_dataset}",
+                        auc_history=ext_auc_hist,
+                    )
 
 
 if __name__ == "__main__":
